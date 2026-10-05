@@ -1,9 +1,9 @@
-#include "engine.h"
+#include "engine.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <llama-cpp.h>
+
 namespace {
 
 using clock_ = std::chrono::steady_clock;
@@ -46,26 +46,30 @@ struct Batch {
   llama_batch get() const { return batch; }
 };
 
-size_t utf8_safe_len(const std::string &s) {
-  size_t n = s.size();
-  if (n == 0)
+// Largest length <= upto that does not split a UTF-8 sequence at the cut.
+size_t utf8_safe_len(const std::string &s, size_t upto) {
+  upto = std::min(upto, s.size());
+  if (upto == 0)
     return 0;
   auto cont = [&](size_t i) { return (((unsigned char)s[i]) & 0xC0) == 0x80; };
-  if (!cont(n - 1))
-    return n - 1;
-  size_t k = 1;
-  while (k < 3 && k < n && cont(n - 1 - k))
-    ++k;
-  if (k < n) {
-    unsigned char lead = (unsigned char)s[n - 1 - k];
-    size_t need = (lead & 0xE0) == 0xC0   ? 1
-                  : (lead & 0xF0) == 0xE0 ? 2
-                  : (lead & 0xF8) == 0xF0 ? 3
-                                          : 0;
-    if (need && k < need)
-      return n - k - 1;
+  if (!cont(upto - 1)) {
+    // Complete ASCII byte, or the lead byte of a sequence that hasn't fully
+    // arrived yet -- only the latter must be held back.
+    return ((unsigned char)s[upto - 1]) < 0x80 ? upto : upto - 1;
   }
-  return n;
+  size_t k = 1;
+  while (k < 4 && k < upto && cont(upto - 1 - k))
+    ++k;
+  if (k >= upto)
+    return 0;
+  unsigned char lead = (unsigned char)s[upto - 1 - k];
+  size_t need = (lead & 0xE0) == 0xC0   ? 1
+                : (lead & 0xF0) == 0xE0 ? 2
+                : (lead & 0xF8) == 0xF0 ? 3
+                                        : 0;
+  if (need && k < need)
+    return upto - k - 1; // sequence incomplete
+  return upto;           // sequence ends exactly at the cut
 }
 
 } // namespace
@@ -77,10 +81,13 @@ LlamaEngine::~LlamaEngine() {
     llama_free(ctx_);
   if (model_)
     llama_model_free(model_);
+  if (backend_up_)
+    llama_backend_free();
 }
 
 bool LlamaEngine::load(const std::string &path, int n_ctx, int n_gpu_layers) {
   llama_backend_init();
+  backend_up_ = true;
 
   llama_model_params mp = llama_model_default_params();
   mp.n_gpu_layers = n_gpu_layers;
@@ -89,6 +96,8 @@ bool LlamaEngine::load(const std::string &path, int n_ctx, int n_gpu_layers) {
     fprintf(stderr, "engine: failed to load '%s'\n", path.c_str());
     return false;
   }
+
+  vocab_ = llama_model_get_vocab(model_);
 
   llama_context_params cp = llama_context_default_params();
   cp.n_ctx = n_ctx;
@@ -102,30 +111,29 @@ bool LlamaEngine::load(const std::string &path, int n_ctx, int n_gpu_layers) {
   }
   n_ctx_ = llama_n_ctx(ctx_);
 
-  llama_sampler_chain_params sp = {};
-  smpl_ = llama_sampler_chain_init(sp);
-  llama_sampler_push(smpl_, llama_sampler_init_greedy());
+  smpl_ = llama_sampler_chain_init(llama_sampler_chain_default_params());
+  llama_sampler_chain_add(smpl_, llama_sampler_init_greedy());
   // llama_sampler_push(smpl_, llama_sampler_init_temp(0.2f));
   // llama_sampler_push(smpl_, llama_sampler_init_dist(1.0f));
 
-  auto probe = tokenize("hello");
-  adds_bos_ = !probe.empty() && probe[0] == llama_token_bos(model_);
+  const auto probe = tokenize("hello");
+  adds_bos_ = !probe.empty() && probe[0] == llama_vocab_bos(vocab_);
   return true;
 }
 
 bool LlamaEngine::truncate_from(llama_pos p0) {
-
-  //   return llama_kv_cache_seq_rm(ctx_, 0, p0, -1);
+  // NOTE: returns false when nothing was actually removed (e.g. the cache is
+  // already empty) -- that is NOT an error.
   return llama_memory_seq_rm(llama_get_memory(ctx_), 0, p0, -1);
 }
 
 std::vector<llama_token> LlamaEngine::tokenize(const std::string &text) const {
-  const int n = llama_tokenize(model_, text.data(), (int32_t)text.size(),
+  const int n = llama_tokenize(vocab_, text.data(), (int32_t)text.size(),
                                nullptr, 0, true, false);
   if (n <= 0)
     return {};
   std::vector<llama_token> toks(n);
-  llama_tokenize(model_, text.data(), (int32_t)text.size(), toks.data(), n,
+  llama_tokenize(vocab_, text.data(), (int32_t)text.size(), toks.data(), n,
                  true, false);
   return toks;
 }
@@ -133,6 +141,8 @@ std::vector<llama_token> LlamaEngine::tokenize(const std::string &text) const {
 void LlamaEngine::reset() {
   if (ctx_)
     truncate_from(0);
+  if (smpl_)
+    llama_sampler_reset(smpl_);
   cached_.clear();
   watermark_ = 0;
 }
@@ -142,37 +152,42 @@ IngestStats LlamaEngine::ingest(const std::string &text) {
   IngestStats st;
   auto ids = tokenize(text);
 
-  // overflow policy: wipe cache, keep only a token tail that fits
+  // Overflow policy: wipe the cache, keep only a token tail that fits.
   if ((size_t)n_ctx_ <= ids.size() + gen_reserve_) {
-    if (!truncate_from(0)) {
-      st.ok = false;
-      return st;
-    }
+    truncate_from(0); // empty cache returns false -- not an error
     cached_.clear();
-    size_t keep = (size_t)n_ctx_ - gen_reserve_ - 8;
+    watermark_ = 0;
+    size_t keep = n_ctx_ > gen_reserve_ + 8 ? n_ctx_ - gen_reserve_ - 8 : 0;
     if (keep < ids.size())
       ids.erase(ids.begin(), ids.end() - keep);
     if (adds_bos_)
-      ids.insert(ids.begin(), llama_token_bos(model_));
+      ids.insert(ids.begin(), llama_vocab_bos(vocab_));
+    if (ids.empty()) {
+      st.ok = false;
+      st.prefill_ms = ms_since(t0);
+      return st;
+    }
   }
 
   size_t lcp = 0;
   while (lcp < cached_.size() && lcp < ids.size() && cached_[lcp] == ids[lcp])
     ++lcp;
 
+  // If the prompt only shrank (or is identical), drop the last token so it
+  // gets re-decoded and produces fresh logits for generate().
   if (lcp == ids.size() && lcp > 0)
     --lcp;
 
   if (lcp < cached_.size()) {
-    if (!truncate_from((llama_pos)lcp)) {
+    if (truncate_from((llama_pos)lcp)) {
+      cached_.resize(lcp);
+    } else {
+      // Unexpected -- fall back to a full re-prefill instead of failing.
       truncate_from(0);
       cached_.clear();
       watermark_ = 0;
-      st.ok = false;
-      st.prefill_ms = ms_since(t0);
-      return st;
+      lcp = 0;
     }
-    cached_.resize(lcp);
   }
 
   st.lcp = lcp;
@@ -206,8 +221,10 @@ LlamaEngine::generate(const GenParams &p,
                       const std::function<void(const std::string &)> &emit,
                       std::atomic<bool> &cancel) {
   GenResult res;
-  if (cached_.empty())
+  if (cached_.empty() || watermark_ == 0) {
+    res.ok = false;
     return res;
+  }
 
   int budget = p.max_tokens;
   if (watermark_ + (size_t)budget + 1 > n_ctx_)
@@ -224,29 +241,50 @@ LlamaEngine::generate(const GenParams &p,
   std::string pending;
   llama_token tok = llama_sampler_sample(smpl_, ctx_, -1);
 
+  auto emit_upto = [&](size_t upto) {
+    if (upto == 0)
+      return;
+    if (first) {
+      res.ttft_ms = ms_since(t0);
+      first = false;
+    }
+    emit(pending.substr(0, upto));
+    pending.erase(0, upto);
+  };
+
   int n = 0;
+  bool stopped = false;
   while (n < budget && !cancel.load(std::memory_order_relaxed)) {
-    if (llama_token_is_eog(model_, tok))
+    if (llama_vocab_is_eog(vocab_, tok))
       break;
 
-    char piece[256];
-    int len = llama_token_to_piece(ctx_, tok, piece, sizeof(piece), 0, false);
-    if (len > 0)
-      pending.append(piece, (size_t)len);
+    {
+      char piece[256];
+      const int len =
+          llama_token_to_piece(vocab_, tok, piece, sizeof(piece), 0, false);
+      if (len > 0) {
+        pending.append(piece, (size_t)len);
+      } else if (len < 0) { // piece didn't fit -- retry with required size
+        std::string big((size_t)(-len), '\0');
+        const int len2 = llama_token_to_piece(vocab_, tok, big.data(),
+                                              (int32_t)big.size(), 0, false);
+        if (len2 > 0)
+          pending.append(big.data(), (size_t)len2);
+      }
+    }
 
-    bool stopped = false;
     size_t upto = pending.size();
     for (const auto &s : p.stop) {
       if (s.empty())
         continue;
-      auto at = pending.find(s);
+      const auto at = pending.find(s);
       if (at != std::string::npos) {
         stopped = true;
         upto = std::min(upto, at);
-        break;
       }
     }
     if (!stopped) {
+      // Hold back enough bytes that a stop sequence could still complete.
       size_t maxstop = 0;
       for (const auto &s : p.stop)
         maxstop = std::max(maxstop, s.size());
@@ -262,17 +300,8 @@ LlamaEngine::generate(const GenParams &p,
           break;
       }
       upto = std::min(upto, pending.size() - hold);
-      upto = std::min(upto, utf8_safe_len(pending.substr(0, upto)));
     }
-
-    if (upto > 0) {
-      emit(pending.substr(0, upto));
-      if (first) {
-        res.ttft_ms = ms_since(t0);
-        first = false;
-      }
-      pending.erase(0, upto);
-    }
+    emit_upto(utf8_safe_len(pending, upto));
     if (stopped)
       break;
 
@@ -285,6 +314,12 @@ LlamaEngine::generate(const GenParams &p,
     ++n;
     tok = llama_sampler_sample(smpl_, ctx_, -1);
   }
+
+  // FIX: bytes still held in `pending` were only withheld because a stop or
+  // UTF-8 sequence might still complete. If generation ended without hitting
+  // a stop, flush them -- otherwise the last character is silently lost.
+  if (!stopped && !pending.empty())
+    emit_upto(utf8_safe_len(pending, pending.size()));
 
   truncate_from((llama_pos)watermark_);
   res.n = n;
